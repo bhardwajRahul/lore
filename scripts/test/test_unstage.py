@@ -29,10 +29,11 @@ def has_staged_anchor(repo: Lore) -> bool:
 
 
 @pytest.mark.smoke
-def test_unstage_clears_staged_state(new_lore_repo):
-    """Verify that unstaging the last staged item fully clears staged state,
-    regardless of whether the unstage target is a directory or a file.
-    The staged state must be empty when nothing remains staged."""
+def test_unstage_clears_stage_flags_keeps_dirty(new_lore_repo):
+    """Unstage clears the stage flags on affected nodes but preserves the dirty
+    flag, so a staged add survives as a dirty add. The staged anchor is NOT
+    removed while any staged or dirty node remains; removing it entirely is the
+    job of `status --reset`."""
 
     repo: Lore = new_lore_repo()
 
@@ -59,8 +60,13 @@ def test_unstage_clears_staged_state(new_lore_repo):
 
     repo.unstage(new_dir)
 
-    assert not has_staged_anchor(repo), (
-        "Staged anchor should be removed after unstaging the only staged directory"
+    assert has_staged_anchor(repo), (
+        "anchor preserved after unstage — the unstaged add remains as a dirty add"
+    )
+    s1 = parse_status_json(repo.status(json=True))
+    s1_file = next((e for e in s1 if to_posix(e["path"]) == to_posix(new_dir_file)), None)
+    assert s1_file is not None and s1_file["flagStaged"] is False and s1_file["flagDirty"] is True, (
+        "unstage clears the stage flag but keeps the dirty flag on the add"
     )
 
     repo.branch_switch("main")
@@ -80,20 +86,23 @@ def test_unstage_clears_staged_state(new_lore_repo):
     repo.unstage(another_file)
 
     assert has_staged_anchor(repo), (
-        "Staged anchor should still exist — parent directory is still staged"
+        "anchor preserved — parent directory is still staged"
     )
 
-    staged_after = parse_status_json(repo.status(json=True))
-    staged_paths_after = [e["path"] for e in staged_after]
-    assert to_posix(another_file) not in staged_paths_after, "File should no longer be staged"
-    assert another_dir in staged_paths_after, (
-        "Parent directory should still be staged (it is also a new add)"
+    s2 = parse_status_json(repo.status(json=True))
+    s2_file = next((e for e in s2 if to_posix(e["path"]) == to_posix(another_file)), None)
+    assert s2_file is not None and s2_file["flagStaged"] is False and s2_file["flagDirty"] is True, (
+        "unstaged file becomes a dirty add (stage flag cleared, dirty kept)"
+    )
+    s2_dir = next((e for e in s2 if to_posix(e["path"]) == to_posix(another_dir)), None)
+    assert s2_dir is not None and s2_dir["flagStaged"] is True, (
+        "parent directory stays staged when only its child is unstaged"
     )
 
     repo.unstage(another_dir)
 
-    assert not has_staged_anchor(repo), (
-        "Staged anchor should be removed after unstaging the parent directory"
+    assert has_staged_anchor(repo), (
+        "anchor preserved — the unstaged nodes remain as dirty adds"
     )
 
     repo.branch_switch("main")
@@ -116,24 +125,26 @@ def test_unstage_clears_staged_state(new_lore_repo):
     repo.stage(file_b)
     assert has_staged_anchor(repo), "Staged anchor should exist after staging"
 
-    # Unstage first directory — second should remain staged
+    # Unstage first directory — its nodes become dirty adds; dirB stays staged
     repo.unstage(dir_a)
 
     assert has_staged_anchor(repo), (
-        "Staged anchor should still exist — dirB is still staged"
+        "anchor preserved — dirB is still staged, dirA is now a dirty add"
     )
 
-    staged_partial = parse_status_json(repo.status(json=True))
-    staged_paths_partial = [e["path"] for e in staged_partial]
-    assert to_posix(file_a) not in staged_paths_partial, "File A should no longer be staged"
-    assert dir_a not in staged_paths_partial, "Dir A should no longer be staged"
-    assert to_posix(file_b) in staged_paths_partial, "File B should remain staged"
+    s3 = parse_status_json(repo.status(json=True))
+    s3_fa = next((e for e in s3 if to_posix(e["path"]) == to_posix(file_a)), None)
+    assert s3_fa is not None and s3_fa["flagStaged"] is False and s3_fa["flagDirty"] is True, (
+        "file A is a dirty add after unstaging dirA"
+    )
+    s3_fb = next((e for e in s3 if to_posix(e["path"]) == to_posix(file_b)), None)
+    assert s3_fb is not None and s3_fb["flagStaged"] is True, "file B remains staged"
 
-    # Unstage second directory — nothing should remain staged
+    # Unstage second directory — its nodes also become dirty adds
     repo.unstage(dir_b)
 
-    assert not has_staged_anchor(repo), (
-        "Staged anchor should be removed after unstaging the last staged directory"
+    assert has_staged_anchor(repo), (
+        "anchor preserved — all unstaged nodes remain as dirty adds"
     )
 
     repo.branch_switch("main")
@@ -154,8 +165,9 @@ def get_unstage_file_events(output: str) -> list[dict]:
 @pytest.mark.smoke
 def test_unstage_discard_counts(new_lore_repo):
     """Verify that unstage reports correct discard and unstage counts in the
-    fileUnstageEnd event for various scenarios: new files, committed files,
-    directories with files, and nested directories."""
+    fileUnstageEnd event for various scenarios. Unstaging a staged add keeps it
+    as a dirty add (counted as UNSTAGED, not discarded); only files emit
+    per-node Keep events, directories are counted but do not emit events."""
 
     repo: Lore = new_lore_repo()
 
@@ -168,7 +180,7 @@ def test_unstage_discard_counts(new_lore_repo):
 
     repo.branch_create("test-discard-counts")
 
-    # Scenario 1: Unstage a new file (clear path — last staged item)
+    # Scenario 1: Unstage a new staged file — kept as a dirty add (unstaged, not discarded)
     with repo.open_file("new_file.txt", "w+") as f:
         f.write("new content\n")
 
@@ -176,11 +188,11 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage("new_file.txt", json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["fileDiscardedCount"] == 1, (
-        f"Scenario 1: expected fileDiscardedCount=1, got {counts['fileDiscardedCount']}"
+    assert counts["fileDiscardedCount"] == 0, (
+        f"Scenario 1: expected fileDiscardedCount=0, got {counts['fileDiscardedCount']}"
     )
-    assert counts["fileUnstagedCount"] == 0, (
-        f"Scenario 1: expected fileUnstagedCount=0, got {counts['fileUnstagedCount']}"
+    assert counts["fileUnstagedCount"] == 1, (
+        f"Scenario 1: expected fileUnstagedCount=1, got {counts['fileUnstagedCount']}"
     )
     assert counts["directoryDiscardedCount"] == 0
     assert counts["directoryUnstagedCount"] == 0
@@ -203,11 +215,11 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage("new_file2.txt", json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["fileDiscardedCount"] == 1, (
-        f"Scenario 2: expected fileDiscardedCount=1, got {counts['fileDiscardedCount']}"
+    assert counts["fileDiscardedCount"] == 0, (
+        f"Scenario 2: expected fileDiscardedCount=0, got {counts['fileDiscardedCount']}"
     )
-    assert counts["fileUnstagedCount"] == 0, (
-        f"Scenario 2: expected fileUnstagedCount=0, got {counts['fileUnstagedCount']}"
+    assert counts["fileUnstagedCount"] == 1, (
+        f"Scenario 2: expected fileUnstagedCount=1, got {counts['fileUnstagedCount']}"
     )
 
     # Clean up: unstage committed.txt too
@@ -245,12 +257,14 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage(dir1, json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["directoryDiscardedCount"] == 1, (
-        f"Scenario 4: expected directoryDiscardedCount=1, got {counts['directoryDiscardedCount']}"
+    assert counts["directoryUnstagedCount"] == 1, (
+        f"Scenario 4: expected directoryUnstagedCount=1, got {counts['directoryUnstagedCount']}"
     )
-    assert counts["fileDiscardedCount"] == 1, (
-        f"Scenario 4: expected fileDiscardedCount=1, got {counts['fileDiscardedCount']}"
+    assert counts["fileUnstagedCount"] == 1, (
+        f"Scenario 4: expected fileUnstagedCount=1, got {counts['fileUnstagedCount']}"
     )
+    assert counts["directoryDiscardedCount"] == 0
+    assert counts["fileDiscardedCount"] == 0
 
     file_events = get_unstage_file_events(output)
     event_paths = [e["path"] for e in file_events]
@@ -274,12 +288,14 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage(dir2, json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["directoryDiscardedCount"] == 1, (
-        f"Scenario 5: expected directoryDiscardedCount=1, got {counts['directoryDiscardedCount']}"
+    assert counts["directoryUnstagedCount"] == 1, (
+        f"Scenario 5: expected directoryUnstagedCount=1, got {counts['directoryUnstagedCount']}"
     )
-    assert counts["fileDiscardedCount"] == 3, (
-        f"Scenario 5: expected fileDiscardedCount=3, got {counts['fileDiscardedCount']}"
+    assert counts["fileUnstagedCount"] == 3, (
+        f"Scenario 5: expected fileUnstagedCount=3, got {counts['fileUnstagedCount']}"
     )
+    assert counts["directoryDiscardedCount"] == 0
+    assert counts["fileDiscardedCount"] == 0
 
     file_events = get_unstage_file_events(output)
     event_paths = sorted([e["path"] for e in file_events])
@@ -287,8 +303,8 @@ def test_unstage_discard_counts(new_lore_repo):
     assert event_paths == expected_paths, (
         f"Scenario 5: expected events for {expected_paths}, got {event_paths}"
     )
-    assert all(e["action"] == "delete" for e in file_events), (
-        "Scenario 5: all events should have action=delete"
+    assert all(e["action"] == "keep" for e in file_events), (
+        "Scenario 5: kept (unstaged) files should have action=keep"
     )
 
     repo.branch_switch("main")
@@ -306,22 +322,20 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage(nested_dir, json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["directoryDiscardedCount"] == 2, (
-        f"Scenario 6: expected directoryDiscardedCount=2, got {counts['directoryDiscardedCount']}"
+    assert counts["directoryUnstagedCount"] == 2, (
+        f"Scenario 6: expected directoryUnstagedCount=2, got {counts['directoryUnstagedCount']}"
     )
-    assert counts["fileDiscardedCount"] == 1, (
-        f"Scenario 6: expected fileDiscardedCount=1, got {counts['fileDiscardedCount']}"
+    assert counts["fileUnstagedCount"] == 1, (
+        f"Scenario 6: expected fileUnstagedCount=1, got {counts['fileUnstagedCount']}"
     )
+    assert counts["directoryDiscardedCount"] == 0
+    assert counts["fileDiscardedCount"] == 0
 
-    # Events should include both the discarded subdirectory and the file
+    # Only files emit per-node events; kept directories are counted but emit none.
     file_events = get_unstage_file_events(output)
     event_paths = sorted([e["path"] for e in file_events])
-    expected_paths = sorted([to_posix(nested_subdir), to_posix(nested_file)])
-    assert event_paths == expected_paths, (
-        f"Scenario 6: expected events for {expected_paths}, got {event_paths}"
-    )
-    assert to_posix(nested_subdir) in event_paths, (
-        f"Scenario 6: discarded directory {nested_subdir} should have an event"
+    assert event_paths == [to_posix(nested_file)], (
+        f"Scenario 6: expected event only for {nested_file}, got {event_paths}"
     )
 
     repo.branch_switch("main")
@@ -336,10 +350,10 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage(json=True)
     counts = get_unstage_counts(output)
 
-    assert counts["fileDiscardedCount"] == 4, (
-        f"Scenario 7: expected fileDiscardedCount=4, got {counts['fileDiscardedCount']}"
+    assert counts["fileUnstagedCount"] == 4, (
+        f"Scenario 7: expected fileUnstagedCount=4, got {counts['fileUnstagedCount']}"
     )
-    assert counts["fileUnstagedCount"] == 0
+    assert counts["fileDiscardedCount"] == 0
     assert counts["directoryDiscardedCount"] == 0
 
     repo.branch_switch("main")
@@ -367,19 +381,21 @@ def test_unstage_discard_counts(new_lore_repo):
     output = repo.unstage(deep, json=True)
     counts = get_unstage_counts(output)
 
-    # 3 directories: deep, mid, bottom (deep itself is counted in unstage_node,
-    # mid and bottom are counted via discard_subnodes)
-    assert counts["directoryDiscardedCount"] == 3, (
-        f"Scenario 8: expected directoryDiscardedCount=3, got {counts['directoryDiscardedCount']}"
+    # 3 directories: deep, mid, bottom (deep counted in unstage_node, mid and
+    # bottom counted via demote_subnodes_to_dirty) — all kept as dirty adds.
+    assert counts["directoryUnstagedCount"] == 3, (
+        f"Scenario 8: expected directoryUnstagedCount=3, got {counts['directoryUnstagedCount']}"
     )
-    assert counts["fileDiscardedCount"] == 3, (
-        f"Scenario 8: expected fileDiscardedCount=3, got {counts['fileDiscardedCount']}"
+    assert counts["fileUnstagedCount"] == 3, (
+        f"Scenario 8: expected fileUnstagedCount=3, got {counts['fileUnstagedCount']}"
     )
+    assert counts["directoryDiscardedCount"] == 0
+    assert counts["fileDiscardedCount"] == 0
 
-    # Every node must get its own event, including nested directories
+    # Only files emit per-node events; nested kept directories are counted but emit none.
     file_events = get_unstage_file_events(output)
     event_paths = sorted([e["path"] for e in file_events])
-    expected_paths = sorted([to_posix(p) for p in deep_files] + [to_posix(mid), to_posix(bottom)])
+    expected_paths = sorted([to_posix(p) for p in deep_files])
     assert event_paths == expected_paths, (
         f"Scenario 8: expected events for {expected_paths}, got {event_paths}"
     )

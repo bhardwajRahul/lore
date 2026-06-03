@@ -2569,6 +2569,32 @@ pub async fn branch_switch(
         }
     };
 
+    // Reject a switch that would discard an actually-staged change; dirty-only
+    // tracking is carried forward by rebase_staged_anchor below. --force and
+    // --reset intentionally discard the staged state instead.
+    if !global.force()
+        && !options.reset
+        && let Some(staged_revision) = crate::instance::load_staged_revision(&repository)
+            .await
+            .ok()
+            .flatten()
+        && !staged_revision.is_zero()
+    {
+        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
+            .await
+            .forward::<RepositoryError>("Failed to deserialize staged state")?;
+        if state_staged
+            .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
+            .await
+            .forward::<RepositoryError>("Failed to check staged nodes")?
+        {
+            return Err(InvalidArguments {
+                reason: "Unable to switch branch when there is a staged state".into(),
+            }
+            .into());
+        }
+    }
+
     if !options.bare {
         // Synchronize state to the current local branch latest
         let sync_options = SyncOptions {

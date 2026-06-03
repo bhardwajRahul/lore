@@ -2226,6 +2226,11 @@ impl State {
                 if child.is_file() {
                     result.push(child_path);
                 } else if child.is_directory() {
+                    // A new (dirty-add) directory is itself a change to stage; an
+                    // empty one has no child files to carry it.
+                    if child.is_dirty_add() {
+                        result.push(child_path.clone());
+                    }
                     stack.push((child_id, child_path));
                 }
             }
@@ -4485,8 +4490,41 @@ pub async fn diff_filesystem_subtree(
     .await
 }
 
+/// Find-or-create the directory node chain from `ROOT_NODE` down to `path`,
+/// marking newly created segments as dirty-add. A path-filtered scan can enter
+/// a directory (or a file's parent) present on disk but absent from `state_from`;
+/// creating the chain lets adds discovered inside resolve their parent node.
+/// Returns the node for the final path segment.
+async fn ensure_scan_dir_chain(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    path: &str,
+) -> Result<NodeID, StateError> {
+    let mut current_node = ROOT_NODE;
+    for segment in path.split('/').filter(|s| !s.is_empty()) {
+        let name_hash = crate::hash::hash_string(segment);
+        if let Ok(child_id) = state
+            .find_subnode(repository.clone(), current_node, name_hash)
+            .await
+        {
+            current_node = child_id;
+        } else {
+            let dir_node = Node {
+                flags: NodeFlags::DirtyAdd.bits(),
+                name_hash,
+                ..Default::default()
+            };
+            current_node = state
+                .node_add(repository.clone(), current_node, dir_node, segment)
+                .await
+                .forward::<StateError>("scan add: failed to create entry directory node")?;
+        }
+    }
+    Ok(current_node)
+}
+
 async fn diff_filesystem_subtree_impl(
-    ctx: DiffFilesystemContext,
+    mut ctx: DiffFilesystemContext,
 ) -> Result<(Vec<NodeChange>, FilesystemDiffStats), StateError> {
     let absolute_path = ctx
         .filesystem_path
@@ -4494,9 +4532,36 @@ async fn diff_filesystem_subtree_impl(
 
     match util::fs::list_path(absolute_path) {
         util::fs::PathListingResult::Directory { receiver } => {
+            // A path-filtered scan can enter a directory present on disk but
+            // absent from state_from (an untracked add). Create its dirty-add
+            // node chain so adds discovered inside resolve their parent node.
+            if ctx.scan_dirty
+                && !ctx.from.root_node.is_valid_or_root_node_id()
+                && !ctx.filesystem_path.is_empty()
+            {
+                let entry_node = ensure_scan_dir_chain(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    ctx.filesystem_path.as_str(),
+                )
+                .await?;
+                ctx.from.root_node = entry_node;
+            }
             diff_filesystem_directory(ctx, receiver).await
         }
-        util::fs::PathListingResult::File { item } => diff_filesystem_single_file(ctx, item).await,
+        util::fs::PathListingResult::File { item } => {
+            // A path-filtered scan of a new file: ensure its parent directory
+            // chain exists so the add resolves its parent node.
+            if ctx.scan_dirty
+                && !ctx.from.root_node.is_valid_node_id()
+                && let Some(parent) = ctx.filesystem_path.parent()
+                && !parent.is_empty()
+            {
+                ensure_scan_dir_chain(ctx.from.repository.clone(), ctx.from.state.clone(), parent)
+                    .await?;
+            }
+            diff_filesystem_single_file(ctx, item).await
+        }
         util::fs::PathListingResult::NotFound => {
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
@@ -4602,6 +4667,10 @@ struct FileDiffContext {
     state_from: Arc<State>,
     from_node_id: NodeID,
     from_node: Option<Node>,
+    /// Parent directory node for a newly added leaf. `Some` from the directory
+    /// walk (the directory being walked), which is correct even across a
+    /// link/layer boundary; `None` for a single-file path, resolved by path.
+    parent_node_id: Option<NodeID>,
     /// When true, set Dirty on modified files and clear Dirty on retained files inline.
     scan_dirty: bool,
 }
@@ -4701,6 +4770,56 @@ async fn emit_unstaged_add(
         sink,
         filter_mode,
     )
+    .await?;
+    stats.file_add.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Emit a single Add change for `node_id` without recursing into its subtree —
+/// the caller's walk recursion surfaces the children. Used to report a dirty-add
+/// directory exactly once per scan (unlike `add_change`, which recurses the whole
+/// hierarchy for a directory add and would double-count against the recursion).
+async fn emit_dirty_add_node_single(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node_id: NodeID,
+    path: &RelativePath,
+    sink: &mut ChangeSink<'_>,
+    stats: &FilesystemDiffStats,
+) -> Result<(), StateError> {
+    let block = state
+        .block(repository.clone(), NodeBlock::index(node_id))
+        .await?;
+    let node = block.node(Node::index(node_id));
+    if !node.is_dirty_add() {
+        state
+            .node_mark_dirty(repository.clone(), node_id, NodeFlags::DirtyAdd, true)
+            .await?;
+    }
+    let block = state
+        .block(repository.clone(), NodeBlock::index(node_id))
+        .await?;
+    let node = block.node(Node::index(node_id));
+    sink.emit(NodeChange {
+        action: change::FileAction::Add,
+        flags: compute_change_flags(&node, change::FileAction::Add, true),
+        from: NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node: INVALID_NODE,
+            flags: NodeFlags::NoFlags,
+            address: Address::default(),
+        },
+        to: NodeChangeState {
+            repository: repository.clone(),
+            state: state.clone(),
+            node: node_id,
+            flags: NodeFlags::from_bits_retain(node.flags),
+            address: node.address,
+        },
+        path: path.clone(),
+        from_path: None,
+    })
     .await?;
     stats.file_add.fetch_add(1, Ordering::Relaxed);
     Ok(())
@@ -4864,13 +4983,25 @@ async fn handle_single_file_compare_result(
             let to_state = if !is_filesystem_directory && ctx.scan_dirty {
                 let parent_path = file_path.parent();
                 let file_name = file_path.name();
-                let parent_node_id = match parent_path {
-                    Some(p) if !p.is_empty() => ctx
-                        .state_from
-                        .find_node_link(ctx.repository_from.clone(), p)
-                        .await
-                        .map_or(ROOT_NODE, |link| link.node),
-                    _ => ROOT_NODE,
+                // The directory walk supplies the parent node directly (correct
+                // even across link/layer boundaries). For a single-file path the
+                // parent was created during discovery, so resolving by path must
+                // succeed.
+                let parent_node_id = if let Some(parent) = ctx.parent_node_id {
+                    parent
+                } else {
+                    match parent_path {
+                        Some(p) if !p.is_empty() => {
+                            ctx.state_from
+                                .find_node_link(ctx.repository_from.clone(), p)
+                                .await
+                                .forward::<StateError>(
+                                    "scan add: parent directory node missing for nested add",
+                                )?
+                                .node
+                        }
+                        _ => ROOT_NODE,
+                    }
                 };
 
                 let node = Node {
@@ -5201,6 +5332,7 @@ async fn diff_filesystem_directory_walk(
                 state_from: node_list.state.clone(),
                 from_node_id: from_named_node.node,
                 from_node: Some(from_node),
+                parent_node_id: Some(ctx.from.root_node),
                 scan_dirty: ctx.scan_dirty,
             };
 
@@ -5262,7 +5394,20 @@ async fn diff_filesystem_directory_walk(
                 .await
             });
         } else if was_directory && is_directory {
-            if is_rename {
+            if ctx.scan_dirty && !current_node_id.is_valid_node_id() {
+                // Re-emit a staged dirty-add directory (in staged, absent from
+                // the current revision) as a single node so repeated scans stay
+                // idempotent; the recursion below surfaces its children.
+                emit_dirty_add_node_single(
+                    node_list.repository.clone(),
+                    node_list.state.clone(),
+                    from_named_node.node,
+                    &item_path,
+                    &mut ChangeSink::Vec(&mut *changes),
+                    stats,
+                )
+                .await?;
+            } else if is_rename {
                 add_change(
                     NodeChangeState {
                         repository: node_list.repository.clone(),
@@ -5332,6 +5477,7 @@ async fn diff_filesystem_directory_walk(
                 state_from: node_list.state.clone(),
                 from_node_id: from_named_node.node,
                 from_node: Some(from_node),
+                parent_node_id: Some(ctx.from.root_node),
                 scan_dirty: ctx.scan_dirty,
             };
 
@@ -5397,6 +5543,20 @@ async fn diff_filesystem_directory_walk(
             );
             pending_discards.push(from_named_node.node);
             continue;
+        }
+
+        // Scan: persist Dirty+Delete on the missing node before recording the change
+        // so compute_change_flags loads the dirty node and includes Dirty in the event.
+        if ctx.scan_dirty {
+            node_list
+                .state
+                .node_mark_dirty(
+                    node_list.repository.clone(),
+                    from_named_node.node,
+                    NodeFlags::DirtyDelete,
+                    true,
+                )
+                .await?;
         }
 
         lore_trace!(
@@ -5491,6 +5651,47 @@ async fn diff_filesystem_directory_walk(
             }
             lore_trace!("Filesystem has new directory in path {child_file_path}, recursing");
 
+            // Scan: persist a Dirty+Add node for the new directory before
+            // recursing, so files inside it resolve their parent and the staged
+            // anchor rebase can descend the dirty subtree. Emit it as a single
+            // node (the recursion below surfaces the children) and recurse
+            // against it so a rescan matches the persisted subtree.
+            let mut dir_from_root = INVALID_NODE;
+            let mut dir_from_path = RelativePath::new();
+            if ctx.scan_dirty {
+                // The new directory is a child of the directory currently being
+                // walked; its node is the correct parent even across link/layer
+                // boundaries (resolving by parent path would not match there).
+                let dir_parent_node = ctx.from.root_node;
+                let dir_node = Node {
+                    flags: NodeFlags::DirtyAdd.bits(),
+                    name_hash: crate::hash::hash_string(file.name.as_str()),
+                    ..Default::default()
+                };
+                let new_dir_id = ctx
+                    .from
+                    .state
+                    .node_add(
+                        ctx.from.repository.clone(),
+                        dir_parent_node,
+                        dir_node,
+                        file.name.as_str(),
+                    )
+                    .await
+                    .forward::<StateError>("scan add: failed to add new directory node")?;
+                emit_dirty_add_node_single(
+                    ctx.from.repository.clone(),
+                    ctx.from.state.clone(),
+                    new_dir_id,
+                    &child_file_path,
+                    &mut ChangeSink::Vec(&mut *changes),
+                    stats,
+                )
+                .await?;
+                dir_from_root = new_dir_id;
+                dir_from_path = child_file_path.clone();
+            }
+
             let repository_from = ctx.from.repository.clone();
             let state_from = ctx.from.state.clone();
             let repository_current = ctx.current.repository.clone();
@@ -5502,8 +5703,8 @@ async fn diff_filesystem_directory_walk(
                     from: FilesystemTraversal {
                         repository: repository_from,
                         state: state_from,
-                        node_path: RelativePath::new(),
-                        root_node: INVALID_NODE,
+                        node_path: dir_from_path,
+                        root_node: dir_from_root,
                     },
                     current: FilesystemTraversal {
                         repository: repository_current,
@@ -5517,6 +5718,12 @@ async fn diff_filesystem_directory_walk(
                     layer_mounts: ctx.layer_mounts.clone(),
                 })
             );
+
+            // The single Dirty+Add directory node emitted above is the scan's
+            // report for this new directory; skip the transient change below.
+            if ctx.scan_dirty {
+                continue 'new_file_iter;
+            }
         }
 
         let file_ctx = FileDiffContext {
@@ -5524,6 +5731,7 @@ async fn diff_filesystem_directory_walk(
             state_from: ctx.from.state.clone(),
             from_node_id: INVALID_NODE,
             from_node: None,
+            parent_node_id: Some(ctx.from.root_node),
             scan_dirty: ctx.scan_dirty,
         };
 
@@ -5630,6 +5838,7 @@ async fn diff_filesystem_single_file(
         state_from: ctx.from.state.clone(),
         from_node_id: ctx.from.root_node,
         from_node,
+        parent_node_id: None,
         scan_dirty: ctx.scan_dirty,
     };
 

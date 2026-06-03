@@ -262,6 +262,32 @@ pub async fn sync(
     let force = execution_context().globals().force();
     let mut location = LoreBranchLocation::Local;
 
+    // Reject a sync that would discard an actually-staged change; dirty-only
+    // tracking is carried forward by rebase_staged_anchor below. --force and
+    // --reset intentionally discard the staged state instead.
+    if !force
+        && !options.reset
+        && let Some(staged_revision) = crate::instance::load_staged_revision(&repository)
+            .await
+            .ok()
+            .flatten()
+        && !staged_revision.is_zero()
+    {
+        let state_staged = state::State::deserialize(repository.clone(), staged_revision)
+            .await
+            .forward::<SyncError>("Failed to deserialize staged state")?;
+        if state_staged
+            .node_has_staged_children(repository.clone(), crate::node::ROOT_NODE)
+            .await
+            .forward::<SyncError>("Failed to check staged nodes")?
+        {
+            return Err(InvalidArguments {
+                reason: "Unable to sync when there is a staged state".into(),
+            }
+            .into());
+        }
+    }
+
     let local_latest = branch::load_latest(repository.clone(), branch_id)
         .await
         .unwrap_or_default();
@@ -523,12 +549,12 @@ pub async fn sync(
     }));
 
     let state_synced = state_target.clone();
-    let result = sync_realize(
+    let result = Box::pin(sync_realize(
         repository.clone(),
         state_current,
         state_target,
         options.clone(),
-    )
+    ))
     .await;
 
     // Make sure caching has finished

@@ -931,23 +931,111 @@ async fn reset_walk_path(ctx: ResetContext, relative_path: RelativePath) -> Resu
             .await
         }
         Err(e) if e.is_node_not_found() => {
-            // The node doesn't exist in state, remove the path from disk
-            lore_debug!(
-                "Node {node_name} with path {} not valid, removing path",
-                relative_path.as_str()
-            );
-
-            stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
-            event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
-                path: LoreString::from(&relative_path),
-                action: LoreFileAction::Delete,
-                from_path: LoreString::default(),
-            })
-            .send();
-
-            util::fs::unlink_recursive(relative_path.to_absolute_path(repository.require_path()?))
+            // A path absent from the target revision is one of: a file committed
+            // in the current revision but added after the target (delete it so the
+            // working tree matches the target), a pending dirty-add, or an
+            // untracked file (keep on disk unless --purge, discarding add tracking).
+            let mut delete_path = options.purge;
+            if let Ok(staged_link) = state_staged
+                .find_node_link(repository.clone(), relative_path.as_str())
                 .await
-                .internal("Failed to remove invalid node")?;
+            {
+                let staged_node = state_staged
+                    .node(repository.clone(), staged_link.node)
+                    .await
+                    .forward::<ResetError>("Failed to find staged node")?;
+
+                if staged_node.is_staged() {
+                    return Err(InvalidArguments {
+                        reason: "Failed to reset staged node".into(),
+                    }
+                    .into());
+                }
+
+                if staged_node.is_dirty_add() {
+                    lore_debug!(
+                        "Reset dirty add {}, discarding staged node and keeping the file",
+                        relative_path.as_str()
+                    );
+
+                    let block_index = NodeBlock::index(staged_link.node);
+                    let node_index = Node::index(staged_link.node);
+                    let block = state_staged
+                        .block(repository.clone(), block_index)
+                        .await
+                        .forward::<ResetError>("Failed to get staged block")?;
+                    {
+                        let mut writer = block.write();
+                        writer.node(node_index).clear_all_change_flags();
+                        writer.mark_dirty();
+                    }
+                    state_staged.block_modified(block.clone(), block_index);
+                    state_staged.mark_dirty();
+
+                    crate::state::node_discard_patch(
+                        state_staged.clone(),
+                        repository.clone(),
+                        staged_link.node,
+                        |_discarded_node_id, _flags| {},
+                    )
+                    .await
+                    .forward::<ResetError>("Failed to discard reset dirty add node")?;
+
+                    // Dirty parent cleanup
+                    let mut parent_id = staged_node.parent;
+                    while parent_id.is_valid_node_id() {
+                        if state_staged
+                            .node_has_dirty_children(repository.clone(), parent_id)
+                            .await
+                            .forward::<ResetError>("Failed to check dirty children")?
+                        {
+                            break;
+                        }
+                        let parent_block_index = NodeBlock::index(parent_id);
+                        let parent_node_index = Node::index(parent_id);
+                        let parent_block = state_staged
+                            .block(repository.clone(), parent_block_index)
+                            .await
+                            .forward::<ResetError>("Failed to get parent block")?;
+                        let parent_node = parent_block.node(parent_node_index);
+                        let next_parent = parent_node.parent;
+                        let dirtied = {
+                            let mut writer = parent_block.write();
+                            writer.node(parent_node_index).clear_dirty_flags();
+                            writer.mark_dirty()
+                        };
+                        if dirtied {
+                            state_staged.block_modified(parent_block, parent_block_index);
+                            state_staged.mark_dirty();
+                        }
+                        if parent_id == ROOT_NODE {
+                            break;
+                        }
+                        parent_id = next_parent;
+                    }
+                } else {
+                    // Committed in the current revision but absent from the target;
+                    // delete it so the working tree matches the target revision.
+                    delete_path = true;
+                }
+            }
+
+            if delete_path {
+                lore_debug!("Reset removing path {}", relative_path.as_str());
+                stats.file_delete_count.fetch_add(1, Ordering::Relaxed);
+                event::LoreEvent::FileResetFile(LoreFileResetFileEventData {
+                    path: LoreString::from(&relative_path),
+                    action: LoreFileAction::Delete,
+                    from_path: LoreString::default(),
+                })
+                .send();
+
+                util::fs::unlink_recursive(
+                    relative_path.to_absolute_path(repository.require_path()?),
+                )
+                .await
+                .internal("Failed to remove path")?;
+            }
 
             Ok(())
         }
@@ -991,7 +1079,10 @@ async fn reset_walk_node(
     if let Ok(staged_block) = state_staged.block(repository.clone(), block_index).await {
         let staged_node = staged_block.node(node_index);
         if staged_node.is_staged() {
-            return Err(ResetError::internal("Failed to reset staged node"));
+            return Err(InvalidArguments {
+                reason: "Failed to reset staged node".into(),
+            }
+            .into());
         }
 
         // Clear Dirty flag if set (reset restores file to current revision)

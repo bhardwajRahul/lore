@@ -164,7 +164,8 @@ def test_commit(new_lore_repo):
     # Stage changes
     _output = repo.stage("first", offline=True)
 
-    # Check status
+    # Check status. `second` stays reported as a dirty/untracked entry from the
+    # earlier scan (status --unstaged is a scan alias that persists dirty state).
     output = repo.status(offline=True)
 
     assert "A " + first_path_file in output, (
@@ -173,7 +174,7 @@ def test_commit(new_lore_repo):
     assert "A " + first_other_file in output, (
         "Missing path in staged status: " + first_other_file
     )
-    assert "A second" not in output, "Unexpected file in staged status: second"
+    assert "A second" in output, "Missing dirty file in status: second"
 
     # Check partial status
     output = repo.status(os.path.join("first", "path"), offline=True)
@@ -189,7 +190,7 @@ def test_commit(new_lore_repo):
     output = repo.status("second", offline=True)
 
     assert "A first" not in output, "Unexpected path in staged status: first"
-    assert "A second" not in output, "Unexpected file in staged status: second"
+    assert "A second" in output, "Missing dirty file in status: second"
 
     output = repo.status("second", offline=True, unstaged=True)
 

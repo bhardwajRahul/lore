@@ -657,11 +657,17 @@ async fn unstage_node(
                 return Ok(());
             }
 
+            // Unstage clears the stage flags but preserves the dirty flag: a
+            // staged ADD therefore survives as a dirty add (and a directory add
+            // demotes its whole subtree likewise), rather than being discarded.
+            // The staged anchor is not removed here — the end-of-unstage logic
+            // removes it only when no staged AND no dirty nodes remain. A
+            // staged-add LINK is still discarded so its registry entry is cleaned.
+            let mut keep_as_dirty_add = false;
             if node.is_staged_add() {
-                lore_debug!("Discarding node ID {found_node_id} staged for add");
-
-                // If the node is a link staged for add, remove the link registry entry
                 if node.is_link() {
+                    lore_debug!("Discarding staged-add link {found_node_id}");
+
                     let link_metadata = node.linked_node();
                     current_state_staged
                         .link_remove(
@@ -671,130 +677,147 @@ async fn unstage_node(
                         )
                         .await
                         .forward::<UnstageError>("Failed to remove link registry entry")?;
-                }
 
-                if node.is_directory() {
-                    discard_subnodes(
-                        current_repository.clone(),
-                        current_state_staged.clone(),
-                        found_node_id,
-                        stats.clone(),
-                    )
-                    .await?;
-
-                    stats
-                        .directory_discarded_count
-                        .fetch_add(1, Ordering::Relaxed);
-                } else {
                     stats.file_discarded_count.fetch_add(1, Ordering::Relaxed);
                     event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
                         path: LoreString::from(&resolved_node_path),
                         action: LoreFileAction::Delete,
                     })
                     .send();
+
+                    {
+                        let mut block_writer = block.write();
+                        block_writer.node(node_index).clear_staged_flags();
+                        if block_writer.mark_dirty() {
+                            current_state_staged.block_modified(block.clone(), block_index);
+                        }
+                    }
+
+                    discard
+                        .entry(current_repository.id)
+                        .or_default()
+                        .push(found_node_id);
+
+                    return Ok(());
                 }
 
-                // Clear staged flags so node_has_staged_children sees
-                // this node as no longer staged (preserves Dirty if set)
+                lore_debug!("Unstaging staged add {found_node_id}: keep as dirty add");
+
+                // Clearing the staged flags on a dirty node preserves Dirty +
+                // action bits, leaving a plain dirty add.
                 {
                     let mut block_writer = block.write();
                     block_writer.node(node_index).clear_staged_flags();
                     if block_writer.mark_dirty() {
                         current_state_staged.block_modified(block.clone(), block_index);
+                        current_state_staged.mark_dirty();
                     }
                 }
+                node.clear_staged_flags();
+                link_tracker.on_node_changed(current_repository.id);
 
-                discard
-                    .entry(current_repository.id)
-                    .or_default()
-                    .push(found_node_id);
-
-                return Ok(());
-            }
-
-            let current_block = current_state
-                .block(current_repository.clone(), block_index)
-                .await
-                .forward::<UnstageError>("Failed deserializing state node block")?;
-
-            let current_node = current_block.node(node_index);
-
-            let was_staged_delete = node.is_staged_delete();
-
-            let was_modified = {
-                if node.is_staged_modify() && node.is_file() {
-                    node.flags |= NodeFlags::File;
-                    node.child = current_node.child;
-                    node.mode = current_node.mode;
-                    node.size = current_node.size;
-
-                    true
-                } else {
-                    false
-                }
-            };
-
-            node.clear_staged_flags();
-
-            link_tracker.on_node_changed(current_repository.id);
-
-            let dirtied = {
-                let mut block_writer = block.write();
-                {
-                    let write_node = block_writer.node(node_index);
-                    if was_modified {
-                        *write_node = node;
-                    } else {
-                        write_node.flags = node.flags;
-                    }
-                }
-                block_writer.mark_dirty()
-            };
-
-            if dirtied {
-                current_state_staged.block_modified(block.clone(), block_index);
-                current_state_staged.mark_dirty();
-            }
-
-            // After clearing Staged, re-check filesystem: clear Dirty if file matches current
-            // revision. If still differs, preserve Dirty.
-            if node.is_dirty() && node.is_file() {
-                let current_repository_root = current_repository.require_path()?;
-                let absolute_path = current_repository_root.join(resolved_node_path.as_str());
-                if let Ok(file_metadata) = tokio::fs::metadata(&absolute_path).await {
-                    let node_path_rel = crate::util::path::RelativePath::new_from_user_path(
-                        current_repository_root,
-                        absolute_path.to_string_lossy().as_ref(),
-                    )
-                    .forward::<UnstageError>("Invalid path")?;
-                    let (file_mtime, file_size) =
-                        crate::util::fs::file_mtime_and_size(&file_metadata);
-                    let (file_modified, _) = crate::state::is_file_modified(
+                if node.is_directory() {
+                    demote_subnodes_to_dirty(
                         current_repository.clone(),
-                        &current_node,
-                        file_mtime,
-                        file_size,
-                        &node_path_rel,
-                        true, /* Force hash check */
+                        current_state_staged.clone(),
+                        found_node_id,
+                        stats.clone(),
                     )
-                    .await
-                    .forward::<UnstageError>("Failed to check if file was modified")?;
+                    .await?;
+                }
 
-                    if !file_modified {
-                        // File matches current revision — clear Dirty
-                        node.clear_dirty_flags();
-                        let dirtied = {
-                            let mut block_writer = block.write();
-                            block_writer.node(node_index).flags = node.flags;
-                            block_writer.mark_dirty()
-                        };
-                        if dirtied {
-                            current_state_staged.block_modified(block.clone(), block_index);
-                            current_state_staged.mark_dirty();
+                keep_as_dirty_add = true;
+            }
+
+            // Default values for the non-keep paths below; only read for link
+            // nodes, which always go through the `!keep_as_dirty_add` branch.
+            let mut was_staged_delete = false;
+            let mut current_node = node;
+            if !keep_as_dirty_add {
+                let current_block = current_state
+                    .block(current_repository.clone(), block_index)
+                    .await
+                    .forward::<UnstageError>("Failed deserializing state node block")?;
+
+                current_node = current_block.node(node_index);
+
+                was_staged_delete = node.is_staged_delete();
+
+                let was_modified = {
+                    if node.is_staged_modify() && node.is_file() {
+                        node.flags |= NodeFlags::File;
+                        node.child = current_node.child;
+                        node.mode = current_node.mode;
+                        node.size = current_node.size;
+
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                node.clear_staged_flags();
+
+                link_tracker.on_node_changed(current_repository.id);
+
+                let dirtied = {
+                    let mut block_writer = block.write();
+                    {
+                        let write_node = block_writer.node(node_index);
+                        if was_modified {
+                            *write_node = node;
+                        } else {
+                            write_node.flags = node.flags;
                         }
                     }
+                    block_writer.mark_dirty()
+                };
+
+                if dirtied {
+                    current_state_staged.block_modified(block.clone(), block_index);
+                    current_state_staged.mark_dirty();
                 }
-                // If file doesn't exist on disk — could be a delete, preserve Dirty
+
+                // After clearing Staged, re-check filesystem: clear Dirty if file matches current
+                // revision. If still differs, preserve Dirty.
+                if node.is_dirty() && node.is_file() {
+                    let current_repository_root = current_repository.require_path()?;
+                    let absolute_path = current_repository_root.join(resolved_node_path.as_str());
+                    if let Ok(file_metadata) = tokio::fs::metadata(&absolute_path).await {
+                        let node_path_rel = crate::util::path::RelativePath::new_from_user_path(
+                            current_repository_root,
+                            absolute_path.to_string_lossy().as_ref(),
+                        )
+                        .forward::<UnstageError>("Invalid path")?;
+                        let (file_mtime, file_size) =
+                            crate::util::fs::file_mtime_and_size(&file_metadata);
+                        let (file_modified, _) = crate::state::is_file_modified(
+                            current_repository.clone(),
+                            &current_node,
+                            file_mtime,
+                            file_size,
+                            &node_path_rel,
+                            true, /* Force hash check */
+                        )
+                        .await
+                        .forward::<UnstageError>("Failed to check if file was modified")?;
+
+                        if !file_modified {
+                            // File matches current revision — clear Dirty
+                            node.clear_dirty_flags();
+                            let dirtied = {
+                                let mut block_writer = block.write();
+                                block_writer.node(node_index).flags = node.flags;
+                                block_writer.mark_dirty()
+                            };
+                            if dirtied {
+                                current_state_staged.block_modified(block.clone(), block_index);
+                                current_state_staged.mark_dirty();
+                            }
+                        }
+                    }
+                    // If file doesn't exist on disk — could be a delete, preserve Dirty
+                }
             }
 
             let mut parent_node_id = node.parent;
@@ -813,6 +836,13 @@ async fn unstage_node(
                     .await
                     .forward::<UnstageError>("Failed deserializing state node block")?;
                 let parent = parent_block.node(parent_node_index);
+
+                // A parent that is itself a staged ADD is a legitimate independent
+                // staged node (not merely staged to carry a descendant), so leave
+                // it staged — unstaging a child must not unstage the parent.
+                if parent.is_staged_add() {
+                    break;
+                }
 
                 let dirtied = {
                     let mut block_writer = parent_block.write();
@@ -926,6 +956,17 @@ async fn unstage_node(
                         )
                         .await
                         .forward::<UnstageError>("Failed to restore link registry entry")?;
+
+                    node.clear_dirty_flags();
+                    let dirtied = {
+                        let mut block_writer = block.write();
+                        block_writer.node(node_index).clear_dirty_flags();
+                        block_writer.mark_dirty()
+                    };
+                    if dirtied {
+                        current_state_staged.block_modified(block.clone(), block_index);
+                        current_state_staged.mark_dirty();
+                    }
                 }
 
                 if options.single_node {
@@ -1096,83 +1137,82 @@ async fn process_link_unstage_updates(
     Ok(())
 }
 
-// TODO(vri): UCS-12299 - Unify codepaths to discard nodes
-async fn discard_subnodes(
+/// Demote a staged-add subtree to dirty in place: clear the staged flags on every
+/// descendant (preserving Dirty + action bits), so an unstaged directory add
+/// survives as a tree of dirty adds rather than being discarded. Each demoted node
+/// is counted as unstaged and (for files) emits a Keep unstage event, matching the
+/// normal per-node unstage path. Self-contained — it walks the subtree directly and
+/// never re-enters `unstage_node`.
+fn demote_subnodes_to_dirty<'a>(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
     node_id: NodeID,
     stats: Arc<UnstageStats>,
-) -> Result<(), UnstageError> {
-    let block_index = NodeBlock::index(node_id);
-    let node_index = Node::index(node_id);
-    let block = state
-        .block(repository.clone(), block_index)
-        .await
-        .forward::<UnstageError>("Failed deserializing state node block")?;
-    let node = block.node(node_index);
-
-    let mut child_node_iter = node.child();
-    let mut cycle = SiblingCycleGuard::new(node_id);
-    while let Some(child_node_id) = child_node_iter {
-        let child_block_index = NodeBlock::index(child_node_id);
-        let child_node_index = Node::index(child_node_id);
-        let child_block = state
-            .block(repository.clone(), child_block_index)
+) -> Pin<Box<dyn Future<Output = Result<(), UnstageError>> + Send + 'a>> {
+    Box::pin(async move {
+        let block_index = NodeBlock::index(node_id);
+        let node_index = Node::index(node_id);
+        let block = state
+            .block(repository.clone(), block_index)
             .await
             .forward::<UnstageError>("Failed deserializing state node block")?;
-        let child_node = child_block.node(child_node_index);
-        child_node
-            .walk_step(child_node_id, node_id, &mut cycle)
-            .forward::<UnstageError>("Invalid node hierarchy in unstage walk")?;
-        let next_child_sibling = child_node.sibling();
+        let node = block.node(node_index);
 
-        lore_trace!("Discarding subnode {child_node_id} nopatch");
-
-        let discarded_node_ids = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let counts = state::node_discard_nopatch(
-            state.clone(),
-            repository.clone(),
-            child_node_id,
-            true,
-            true,
-            {
-                let discarded_node_ids = discarded_node_ids.clone();
-                move |discarded_node_id, _flags| {
-                    lore_debug!("Discarded node {discarded_node_id} without patching");
-                    discarded_node_ids.lock().push(discarded_node_id);
-                }
-            },
-        )
-        .await
-        .forward::<UnstageError>("Failed to discard node")?;
-
-        stats
-            .file_discarded_count
-            .fetch_add(counts.file_count, Ordering::Relaxed);
-        stats
-            .directory_discarded_count
-            .fetch_add(counts.directory_count, Ordering::Relaxed);
-
-        // Emit events for each discarded node. node_path works post-discard
-        // because discard_node preserves names for history weaving
-        let discarded_node_ids: Vec<_> = discarded_node_ids.lock().drain(..).collect();
-
-        for discarded_id in discarded_node_ids.iter() {
-            let path = state
-                .node_path(repository.clone(), *discarded_id)
+        let mut child_node_iter = node.child();
+        let mut cycle = SiblingCycleGuard::new(node_id);
+        while let Some(child_node_id) = child_node_iter {
+            let child_block_index = NodeBlock::index(child_node_id);
+            let child_node_index = Node::index(child_node_id);
+            let child_block = state
+                .block(repository.clone(), child_block_index)
                 .await
-                .unwrap_or_default();
-            event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
-                path: path.into(),
-                action: LoreFileAction::Delete,
-            })
-            .send();
+                .forward::<UnstageError>("Failed deserializing state node block")?;
+            let child_node = child_block.node(child_node_index);
+            child_node
+                .walk_step(child_node_id, node_id, &mut cycle)
+                .forward::<UnstageError>("Invalid node hierarchy in unstage walk")?;
+            let next_child_sibling = child_node.sibling();
+
+            // Clear staged flags (preserves Dirty + action bits when Dirty is set).
+            let dirtied = {
+                let mut block_writer = child_block.write();
+                block_writer.node(child_node_index).clear_staged_flags();
+                block_writer.mark_dirty()
+            };
+            if dirtied {
+                state.block_modified(child_block.clone(), child_block_index);
+                state.mark_dirty();
+            }
+
+            if child_node.is_directory() {
+                stats
+                    .directory_unstaged_count
+                    .fetch_add(1, Ordering::Relaxed);
+                demote_subnodes_to_dirty(
+                    repository.clone(),
+                    state.clone(),
+                    child_node_id,
+                    stats.clone(),
+                )
+                .await?;
+            } else {
+                stats.file_unstaged_count.fetch_add(1, Ordering::Relaxed);
+                let child_path = state
+                    .node_path(repository.clone(), child_node_id)
+                    .await
+                    .unwrap_or_default();
+                event::LoreEvent::FileUnstageFile(LoreFileUnstageFileEventData {
+                    path: child_path.into(),
+                    action: LoreFileAction::Keep,
+                })
+                .send();
+            }
+
+            child_node_iter = next_child_sibling;
         }
 
-        child_node_iter = next_child_sibling;
-    }
-
-    Ok(())
+        Ok(())
+    })
 }
 
 // TODO(vri): UCS-12299 - Unify codepaths to discard nodes

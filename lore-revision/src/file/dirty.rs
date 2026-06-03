@@ -208,6 +208,17 @@ async fn dirty_path(
         .ok();
 
     if exists_on_disk && is_dir {
+        // A new directory is itself an add; mark it so an empty one is tracked
+        // even though the child recursion finds no files to anchor it.
+        if !in_current_revision && staged_link.is_none() {
+            dirty_add_directory(
+                repository.clone(),
+                state_staged.clone(),
+                relative_path,
+                stats.clone(),
+            )
+            .await?;
+        }
         // Directory on disk -> recurse children
         lore_debug!("Dirty directory recurse: {}", relative_path.as_str());
         dirty_directory(
@@ -443,6 +454,45 @@ async fn dirty_add(
 
     stats.add_count.fetch_add(1, Ordering::Relaxed);
 
+    Ok(())
+}
+
+/// Mark a new (untracked) directory node as Dirty+Add in the staged tree,
+/// creating any missing ancestor directory nodes. Mirrors `dirty_add` for the
+/// directory case so a brand-new EMPTY directory is tracked even when the child
+/// recursion finds no files to anchor it.
+async fn dirty_add_directory(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    relative_path: &RelativePath,
+    stats: Arc<DirtyStats>,
+) -> Result<(), DirtyError> {
+    let parent_path = relative_path.parent();
+    let dir_name = relative_path.name();
+
+    let parent_node_id = match parent_path {
+        Some(p) if !p.is_empty() => {
+            ensure_dirty_parent_dirs(repository.clone(), state.clone(), p).await?
+        }
+        _ => ROOT_NODE,
+    };
+
+    let node = Node {
+        flags: NodeFlags::DirtyAdd.bits(),
+        name_hash: crate::hash::hash_string(dir_name),
+        ..Default::default()
+    };
+    state
+        .node_add(repository.clone(), parent_node_id, node, dir_name)
+        .await
+        .forward::<DirtyError>("Failed to add dirty directory node")?;
+
+    state
+        .node_mark_dirty(repository.clone(), parent_node_id, NodeFlags::Dirty, false)
+        .await
+        .forward::<DirtyError>("Failed to propagate dirty to parent")?;
+
+    stats.add_count.fetch_add(1, Ordering::Relaxed);
     Ok(())
 }
 

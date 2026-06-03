@@ -2401,6 +2401,15 @@ pub async fn merge_abort(
     }
 
     let _ = crate::instance::delete_staged_anchor(&repository).await;
+
+    // Aborting cancels the merge, not the user's unrelated dirty edits: restore
+    // the pre-existing dirty-only carry's tracking (its on-disk content was left
+    // untouched by the abort) before clearing the carry blob.
+    if let Ok(Some(carry)) = crate::merge_carry::load(repository.clone()).await
+        && !carry.paths.is_empty()
+    {
+        let _ = crate::file::dirty::dirty_relative_paths(repository.clone(), carry.paths).await;
+    }
     let _ = crate::merge_carry::delete(repository.clone()).await;
 
     Ok(())

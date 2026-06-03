@@ -434,14 +434,17 @@ pub(crate) async fn stage_filesystem_path(
                 return Ok(node_link);
             }
 
-            // Get the updated name in case it was changed by the case mismatch resolver
-            let final_name = current_state
-                .node_name_ref(current_repository.clone(), node_link.node)
-                .await
-                .forward::<StageError>("Failed to resolve node name")?;
+            // Scoped so the node_name_ref read lock drops before node() below; a
+            // second shared lock on the same block deadlocks behind a queued writer.
+            {
+                let final_name = current_state
+                    .node_name_ref(current_repository.clone(), node_link.node)
+                    .await
+                    .forward::<StageError>("Failed to resolve node name")?;
+                current_absolute_path.push(&*final_name);
+                current_relative_path.push(&final_name);
+            }
 
-            current_absolute_path.push(&*final_name);
-            current_relative_path.push(&final_name);
             let node = current_state
                 .node(current_repository.clone(), node_link.node)
                 .await
@@ -892,6 +895,30 @@ pub(crate) async fn stage_merge_path(
     Ok(())
 }
 
+/// After staging a filesystem-detected change, also mark the node dirty so that
+/// `flagDirty` reflects the working-tree difference: any uncommitted change is
+/// dirty, whether it was recorded by `dirty`, `status --scan` or `stage`/
+/// `stage --scan`. `node_mark` only sets staged bits (it preserves an existing
+/// Dirty but never sets one), so the dirty bit must be applied here.
+///
+/// Skipped for merge staging — a merge resolution is not a fresh filesystem
+/// detection and keeps its own staged/merge flags.
+async fn mark_staged_node_dirty(
+    repository: Arc<RepositoryContext>,
+    state: &Arc<State>,
+    node_id: NodeID,
+    dirty_flags: NodeFlags,
+    node_flags: NodeFlags,
+) -> Result<(), StageError> {
+    if node_flags.contains(NodeFlags::StagedMerge) {
+        return Ok(());
+    }
+    state
+        .node_mark_dirty(repository, node_id, dirty_flags, true)
+        .await
+        .forward::<StageError>("Failed to mark staged node as dirty")
+}
+
 pub(crate) async fn stage_delete(
     repository: Arc<RepositoryContext>,
     state: Arc<State>,
@@ -950,6 +977,15 @@ pub(crate) async fn stage_delete(
         )
         .await
         .forward::<StageError>("Failed to mark node as staged")?;
+
+    mark_staged_node_dirty(
+        repository.clone(),
+        &state,
+        node_id,
+        NodeFlags::DirtyDelete,
+        node_flags,
+    )
+    .await?;
 
     if let Some(ref tracker) = link_tracker {
         tracker.on_node_changed(repository.id);
@@ -1308,15 +1344,16 @@ pub(crate) async fn stage_directory(
                             tracker.add_link(link_context);
                         }
 
-                        let node_name = state
-                            .node_name_ref(repository.clone(), node_link.node)
-                            .await
-                            .forward::<StageError>("Failed to resolve node name")?;
-
-                        absolute_path.push(&node_name);
-
                         let mut link_relative_path = relative_path.clone();
-                        link_relative_path.push(&node_name);
+                        // Scoped so the read lock drops before the recurse below.
+                        {
+                            let node_name = state
+                                .node_name_ref(repository.clone(), node_link.node)
+                                .await
+                                .forward::<StageError>("Failed to resolve node name")?;
+                            absolute_path.push(&node_name);
+                            link_relative_path.push(&node_name);
+                        }
 
                         let result = stage_directory_recurse(
                             linked_repository.clone(),
@@ -1667,6 +1704,15 @@ pub(crate) async fn stage_node_from_metadata(
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
 
+        mark_staged_node_dirty(
+            repository.clone(),
+            &state,
+            node_id,
+            NodeFlags::DirtyAdd,
+            options.node_flags,
+        )
+        .await?;
+
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(repository.id);
         }
@@ -1731,6 +1777,15 @@ pub(crate) async fn stage_node_from_metadata(
             )
             .await
             .forward::<StageError>("Failed to mark node as staged")?;
+
+        mark_staged_node_dirty(
+            repository.clone(),
+            &state,
+            node_link.node,
+            NodeFlags::DirtyModify,
+            options.node_flags,
+        )
+        .await?;
 
         if let Some(ref tracker) = link_tracker {
             tracker.on_node_changed(repository.id);
@@ -1909,6 +1964,10 @@ pub(crate) async fn stage_node_from_metadata(
             node.flags &= !NodeFlags::File;
             node.mode = 0;
             maybe_content_modified = true;
+        } else if node.is_dirty_add() {
+            // A new directory has no content change to detect but must still be
+            // staged.
+            maybe_content_modified = true;
         }
 
         if maybe_content_modified
@@ -1937,6 +1996,15 @@ pub(crate) async fn stage_node_from_metadata(
                 )
                 .await
                 .forward::<StageError>("Failed to mark node as staged")?;
+
+            mark_staged_node_dirty(
+                repository.clone(),
+                &state,
+                node_link.node,
+                NodeFlags::DirtyModify,
+                options.node_flags,
+            )
+            .await?;
 
             lore_debug!(
                 "Staged existing node {} as modified for {}",

@@ -1018,6 +1018,8 @@ async fn commit_staged_revision(
         }
     }
 
+    prune_dirty_for_commit(state_staged.clone(), repository.clone()).await?;
+
     // Per-operation tracker for background fragment uploads. Write-producing
     // calls below dispatch leader tasks into it; await_all drains every
     // outstanding task before returning — on success AND on any error path.
@@ -2144,6 +2146,8 @@ async fn commit_link(
         absolute_path.to_str().unwrap_or_default(),
         node_path
     );
+
+    prune_dirty_for_commit(state.clone(), repository.clone()).await?;
 
     // Graceful-drain pattern mirroring commit_staged_revision: run all
     // write-producing work under `work_tracker`, then ALWAYS drain so leaders

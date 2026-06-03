@@ -1593,7 +1593,7 @@ def test_branch_merge_carries_dirty_through_conflict_merge(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_branch_merge_abort_clears_dirty_carry(new_lore_repo):
+def test_branch_merge_abort_keeps_dirty_carry(new_lore_repo):
     """After `merge abort`, the dirty tracking captured at `merge start`
     is dropped — a subsequent unrelated commit does not re-apply it.
     """
@@ -1628,8 +1628,8 @@ def test_branch_merge_abort_clears_dirty_carry(new_lore_repo):
     )
     repo.branch_merge_abort(offline=True)
 
-    # After abort the staged anchor and the carry are both gone — the
-    # next clean commit must not replay the carried dirty path.
+    # Abort cancels the merge but preserves the unrelated dirty-only carry; an
+    # unrelated later commit leaves the carry pending as a dirty modify.
     with repo.open_file("staged_post.txt", "w+") as f:
         f.write("post-abort\n")
     repo.stage("staged_post.txt", offline=True)
@@ -1639,8 +1639,9 @@ def test_branch_merge_abort_clears_dirty_carry(new_lore_repo):
     assert find_status_entry(entries, "staged_post.txt") is None, (
         "staged_post.txt should be clean after commit"
     )
-    assert find_status_entry(entries, "base.txt") is None, (
-        "merge abort cleared the carry so base.txt's dirty tracking is gone"
+    carry = find_status_entry(entries, "base.txt")
+    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
+        "merge abort preserves the pre-existing dirty-only carry"
     )
 
 
@@ -1790,7 +1791,7 @@ def test_cherry_pick_carries_dirty_through_conflict_pick(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_cherry_pick_abort_clears_dirty_carry(new_lore_repo):
+def test_cherry_pick_abort_keeps_dirty_carry(new_lore_repo):
     """`cherry-pick abort` clears the `merge_carry` blob (it delegates
     to `merge_abort`, which already handles carry cleanup)."""
     repo: Lore = new_lore_repo()
@@ -1825,8 +1826,8 @@ def test_cherry_pick_abort_clears_dirty_carry(new_lore_repo):
     )
     repo.revision_cherry_pick_abort(offline=True)
 
-    # After abort, carry is gone — a subsequent unrelated commit must not
-    # replay the carried path.
+    # Abort cancels the pick but preserves the unrelated dirty-only carry; a
+    # subsequent unrelated commit leaves the carry pending as a dirty modify.
     with repo.open_file("staged_post.txt", "w+") as f:
         f.write("post-abort\n")
     repo.stage("staged_post.txt", offline=True)
@@ -1836,8 +1837,9 @@ def test_cherry_pick_abort_clears_dirty_carry(new_lore_repo):
     assert find_status_entry(entries, "staged_post.txt") is None, (
         "staged_post.txt should be clean after commit"
     )
-    assert find_status_entry(entries, "base.txt") is None, (
-        "cherry-pick abort cleared the carry so base.txt's dirty tracking is gone"
+    carry = find_status_entry(entries, "base.txt")
+    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
+        "cherry-pick abort preserves the pre-existing dirty-only carry"
     )
 # ===========================================================================
 # Branch reset with dirty-only tracking
@@ -2066,7 +2068,7 @@ def test_revert_carries_dirty_through_conflict_revert(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_revert_abort_clears_dirty_carry(new_lore_repo):
+def test_revert_abort_keeps_dirty_carry(new_lore_repo):
     """After `revert abort`, the dirty tracking captured at `revert start`
     is dropped — a subsequent unrelated commit does not re-apply it.
     """
@@ -2109,6 +2111,7 @@ def test_revert_abort_clears_dirty_carry(new_lore_repo):
     assert find_status_entry(entries, "staged_post.txt") is None, (
         "staged_post.txt should be clean after commit"
     )
-    assert find_status_entry(entries, "base.txt") is None, (
-        "revert abort dropped the dirty tracking captured at revert start"
+    carry = find_status_entry(entries, "base.txt")
+    assert carry is not None and carry["flagDirty"] is True and carry["flagStaged"] is False, (
+        "revert abort preserves the pre-existing dirty-only carry"
     )
