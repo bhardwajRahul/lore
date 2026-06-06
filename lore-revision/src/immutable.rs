@@ -3,6 +3,7 @@
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -448,11 +449,14 @@ pub async fn cache(
         let _ = query_address.split_to(size_of::<Address>());
     }
 
+    let start = Instant::now();
     let mut total_store_count = 0;
+    let mut total_query_count = 0;
 
     while !query_address.is_empty() {
         let query_count = query_address.count::<Address>();
-        lore_debug!("Query and cache {query_count} immutable fragments from remote");
+        total_query_count += query_count;
+        lore_trace!("Query and cache {query_count} immutable fragments from remote");
 
         let mut query_tasks: JoinSet<Result<(Bytes, Vec<StoreMatch>), StoreError>> = JoinSet::new();
         while !query_address.is_empty() {
@@ -561,7 +565,7 @@ pub async fn cache(
         }
 
         if fetch_count > 0 {
-            lore_debug!(
+            lore_trace!(
                 "Fetch and store {fetch_count} / {query_count} immutable fragments from remote"
             );
         }
@@ -574,7 +578,7 @@ pub async fn cache(
         }
 
         if !store_tasks.is_empty() {
-            lore_debug!(
+            lore_trace!(
                 "Wait for {} immutable fragments to be stored",
                 store_tasks.len(),
             );
@@ -592,17 +596,22 @@ pub async fn cache(
         }
     }
 
+    lore_debug!(
+        "Cached {total_store_count} / {total_query_count} immutable fragments from remote in {:.3}s",
+        start.elapsed().as_secs_f64()
+    );
+
     Ok(total_store_count)
 }
 
 pub async fn is_stored_local(repository: Arc<RepositoryContext>, address: Address) -> bool {
-    lore_debug!("Check if {} is cached in local store", address);
+    lore_trace!("Check if {} is cached in local store", address);
     if let Ok(query) = repository
         .immutable_store()
         .query(repository.id, address, StoreMatch::MatchHash)
         .await
     {
-        lore_debug!("Query result {:?}", query);
+        lore_trace!("Query result {:?}", query);
         query.match_made != StoreMatch::MatchNone
             && (query.fragment.flags & FragmentFlags::PayloadStoredLocal) != 0
     } else {

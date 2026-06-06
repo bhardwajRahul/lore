@@ -2741,9 +2741,7 @@ impl State {
         address.push(Address::zero_context_hash(tree.hash_file_metadata));
 
         // Disregard any errors during caching
-        let total_store_count = immutable::cache(repository.clone(), address, true)
-            .await
-            .unwrap_or_default();
+        let _ = immutable::cache(repository.clone(), address, true).await;
 
         /* Avoid caching all the blocks, generally it's better to fetch these on demand
            as it parallelizes better with other i/o
@@ -2766,18 +2764,8 @@ impl State {
             .map(|&hash| Address::zero_context_hash(hash))
             .collect();
 
-        total_store_count += immutable::cache(repository.clone(), address, false)
-            .await
-            .unwrap_or_default();
+        let _ = immutable::cache(repository.clone(), address, false).await;
         */
-
-        if total_store_count > 0 {
-            lore_debug!(
-                "State fragment cache done, {total_store_count} fragments stored, flush stores"
-            );
-            let _ = repository.immutable_store().flush(false).await;
-            lore_debug!("State fragment cache flushed stores");
-        }
 
         Ok(())
     }

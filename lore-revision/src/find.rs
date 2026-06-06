@@ -19,6 +19,7 @@ use crate::lore::BranchId;
 use crate::lore::Context;
 use crate::lore::Hash;
 use crate::lore_debug;
+use crate::lore_trace;
 use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 use crate::state::State;
@@ -97,7 +98,7 @@ where
 
         match matcher(state.clone(), metadata) {
             FindMatchResult::Continue => {
-                lore_debug!(
+                lore_trace!(
                     "Revision {} does not match, continue to parent revision {}",
                     revision,
                     state.parent_self()
@@ -213,7 +214,7 @@ pub async fn revision_by_number(
                     FindMatchResult::Abort
                 }
                 Ordering::Greater => {
-                    lore_debug!(
+                    lore_trace!(
                         "Revision number {} greater than search number {} for revision {}",
                         state_revision_number,
                         revision_number,
