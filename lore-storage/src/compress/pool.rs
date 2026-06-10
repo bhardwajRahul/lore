@@ -18,10 +18,15 @@ use super::compress_into;
 use super::decompress_into;
 use crate::Fragment;
 
-/// Payload size below which compression/decompression runs inline on the caller's
-/// thread instead of being dispatched to the pool. For fragments this small the
-/// pool submit/await round trip costs more than the compression work itself.
-const INLINE_WORK_SIZE_THRESHOLD: usize = 4 * 1024;
+/// Payload size below which compression runs inline on the caller's thread
+/// instead of being dispatched to the pool. For fragments this small the pool
+/// submit/await round trip costs more than the compression work itself.
+const INLINE_COMPRESS_SIZE_THRESHOLD: usize = 4 * 1024;
+
+/// Decompressed size below which decompression runs inline on the caller's
+/// thread. Higher than the compress threshold because decompression is cheaper
+/// per byte, so a larger fragment still beats the pool round-trip overhead.
+const INLINE_DECOMPRESS_SIZE_THRESHOLD: usize = 32 * 1024;
 
 type CompressResult = Result<(Fragment, Bytes), FragmentError>;
 type DecompressResult = Result<(Fragment, BytesMut), FragmentError>;
@@ -134,7 +139,7 @@ pub async fn decompress_async(
     // Run inline for fragments whose payload work is smaller than the pool
     // round-trip overhead. size_content is the decompressed size, which is
     // what governs actual decompression cost.
-    if (fragment.size_content as usize) < INLINE_WORK_SIZE_THRESHOLD {
+    if (fragment.size_content as usize) < INLINE_DECOMPRESS_SIZE_THRESHOLD {
         return decompress_into(fragment, compressed.as_ref(), output_buffer);
     }
 
@@ -161,7 +166,7 @@ pub async fn compress_async(
     // Run inline for small payloads; see [`decompress_async`] for the
     // rationale. For compression size_payload == size_content (uncompressed
     // input is required), so either is a valid cutoff metric.
-    if (fragment.size_payload as usize) < INLINE_WORK_SIZE_THRESHOLD {
+    if (fragment.size_payload as usize) < INLINE_COMPRESS_SIZE_THRESHOLD {
         return compress_into(
             fragment,
             &payload.as_ref()[..fragment.size_payload as usize],

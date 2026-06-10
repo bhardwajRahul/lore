@@ -600,13 +600,13 @@ async fn fetch_ordered_and_stream(
 /// Write sink for file/mmap targets.
 async fn write_to_sink(
     sink: DefragmentSink,
-    mut data_rx: Receiver<(usize, Bytes)>,
+    data_rx: Receiver<(usize, Bytes)>,
 ) -> Result<(), StorageError> {
     match sink {
         DefragmentSink::Mmap { ptr, len } => {
-            write_to_sink_mmap(MmapPtr { ptr, len }, &mut data_rx).await
+            write_to_sink_mmap(MmapPtr { ptr, len }, data_rx).await
         }
-        DefragmentSink::File { file } => write_to_sink_file(file, &mut data_rx).await,
+        DefragmentSink::File { file } => write_to_sink_file(file, data_rx).await,
         DefragmentSink::Stream { .. } => {
             debug_assert!(false, "write_to_sink called with Stream sink");
             Ok(())
@@ -623,50 +623,112 @@ struct MmapPtr {
 unsafe impl Send for MmapPtr {}
 unsafe impl Sync for MmapPtr {}
 
+/// Send-safe wrapper for a single bounds-checked destination pointer moved
+/// into a blocking copy task. The whole wrapper must be captured (not the
+/// bare `*mut u8` field) for the closure to stay `Send`.
+struct DstPtr(*mut u8);
+
+unsafe impl Send for DstPtr {}
+
+/// Copy size above which the mmap `memcpy` is offloaded to a blocking thread.
+/// A file-backed mmap faults each touched page in synchronously, so a large
+/// copy can stall for milliseconds; below this size the `spawn_blocking` round
+/// trip costs more than copying inline.
+const MMAP_COPY_OFFLOAD_THRESHOLD: usize = 4 * 1024;
+
 /// Drains `(offset, data)` messages from the fetch pool and copies each
 /// payload to the corresponding mmap region.
+///
+/// The copy into a file-backed mmap is effectively an `fwrite`: each touched
+/// page faults in synchronously, so on a cold mapping the `memcpy` can stall
+/// for milliseconds. The drain loop and bounds check stay on the async worker
+/// (cheap), but copies at or above [`MMAP_COPY_OFFLOAD_THRESHOLD`] are spawned
+/// onto blocking threads via a `JoinSet`, so page-fault stalls never block a
+/// runtime worker and independent copies overlap. Smaller copies run inline as
+/// the `spawn_blocking` round trip would cost more than the copy. Completed
+/// copies are reaped each iteration; the rest are joined after the channel
+/// closes. A copy-task or bounds error breaks the drain loop and still joins
+/// the spawned tasks before returning.
 ///
 /// # Invariants relied on
 ///
 /// - **Non-overlapping writes.** Messages are assumed to target disjoint
 ///   byte ranges. The fragment-list walker's strict-increasing offset check
 ///   plus the leaf contiguity check (actual leaf `size_content` equals the
-///   offset delta) guarantee this for any well-formed fragment tree. If a
-///   future producer forwards into this channel without that validation,
-///   overlapping writes would clobber each other last-write-wins. That's
-///   not memory-unsafe — calls here are serialized by the single consumer
-///   task — but it would silently corrupt the reassembled content.
+///   offset delta) guarantee this for any well-formed fragment tree. This is
+///   now load-bearing for *memory safety*: offloaded copies run concurrently,
+///   so two copies into overlapping regions would be a data race. A future
+///   producer that forwards into this channel without that validation must
+///   re-establish disjointness.
 /// - **Bounded offset.** The bounds check below is the last line of defence
 ///   against a compromised offset; do not remove it even if upstream
 ///   appears to already cap offsets.
 async fn write_to_sink_mmap(
     mmap: MmapPtr,
-    data_rx: &mut Receiver<(usize, Bytes)>,
+    mut data_rx: Receiver<(usize, Bytes)>,
 ) -> Result<(), StorageError> {
+    let mut tasks: JoinSet<()> = JoinSet::new();
+    let mut result = Ok(());
+
     while let Some((offset, payload)) = data_rx.recv().await {
-        let data = payload.as_ref();
+        let len = payload.len();
         // Runtime bounds check: a compromised fragment list can feed an
         // out-of-range `offset` here. An OOB write would be memory-unsafe.
-        let end = offset.checked_add(data.len()).ok_or_else(|| {
-            StorageError::internal("mmap write offset + data length overflows usize")
-        })?;
+        let Some(end) = offset.checked_add(len) else {
+            result = Err(StorageError::internal(
+                "mmap write offset + data length overflows usize",
+            ));
+            break;
+        };
         if end > mmap.len {
-            return Err(StorageError::internal(format!(
-                "mmap write out of bounds: offset {offset} + {} > {}",
-                data.len(),
+            result = Err(StorageError::internal(format!(
+                "mmap write out of bounds: offset {offset} + {len} > {}",
                 mmap.len
             )));
+            break;
         }
-        unsafe {
-            std::ptr::copy_nonoverlapping(data.as_ptr(), mmap.ptr.add(offset), data.len());
+
+        // SAFETY: `offset + len <= mmap.len` was just verified, so the region
+        // lies within the mapping, and the non-overlapping invariant above
+        // guarantees it does not alias any concurrent copy's destination.
+        let dst = DstPtr(unsafe { mmap.ptr.add(offset) });
+
+        if len < MMAP_COPY_OFFLOAD_THRESHOLD {
+            unsafe {
+                std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.0, len);
+            }
+        } else {
+            lore_base::lore_spawn_blocking!(tasks, move || {
+                let dst = dst;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(payload.as_ptr(), dst.0, len);
+                }
+            });
+        }
+
+        // Reap copies that have already finished without blocking.
+        while let Some(join_result) = tasks.try_join_next() {
+            result = result.and(
+                join_result.map_err(|e| StorageError::internal_with_context(e, "mmap copy task")),
+            );
+        }
+        if result.is_err() {
+            break;
         }
     }
-    Ok(())
+
+    // Join any copies still in flight (also drains them after an early break).
+    while let Some(join_result) = tasks.join_next().await {
+        result = result
+            .and(join_result.map_err(|e| StorageError::internal_with_context(e, "mmap copy task")));
+    }
+
+    result
 }
 
 async fn write_to_sink_file(
     file: Arc<Mutex<File>>,
-    data_rx: &mut Receiver<(usize, Bytes)>,
+    mut data_rx: Receiver<(usize, Bytes)>,
 ) -> Result<(), StorageError> {
     let mut retry = crate::retry(10, 10_000, 10);
     while let Some((offset, payload)) = data_rx.recv().await {
@@ -1175,12 +1237,12 @@ mod tests {
                 ptr,
                 len: buf.len(),
             };
-            let (tx, mut rx) = channel::<(usize, Bytes)>(4);
+            let (tx, rx) = channel::<(usize, Bytes)>(4);
             tx.send((10usize, Bytes::from(vec![0xAB; 20])))
                 .await
                 .expect("send");
             drop(tx);
-            super::super::write_to_sink_mmap(mmap, &mut rx)
+            super::super::write_to_sink_mmap(mmap, rx)
                 .await
                 .expect("in-bounds write");
             assert_eq!(&buf[10..30], &[0xAB; 20]);
@@ -1194,12 +1256,12 @@ mod tests {
                 ptr,
                 len: buf.len(),
             };
-            let (tx, mut rx) = channel::<(usize, Bytes)>(4);
+            let (tx, rx) = channel::<(usize, Bytes)>(4);
             tx.send((95usize, Bytes::from(vec![0u8; 10])))
                 .await
                 .expect("send"); // 95 + 10 = 105 > 100
             drop(tx);
-            let err = super::super::write_to_sink_mmap(mmap, &mut rx)
+            let err = super::super::write_to_sink_mmap(mmap, rx)
                 .await
                 .expect_err("OOB should be rejected");
             assert!(
@@ -1216,12 +1278,12 @@ mod tests {
                 ptr,
                 len: buf.len(),
             };
-            let (tx, mut rx) = channel::<(usize, Bytes)>(4);
+            let (tx, rx) = channel::<(usize, Bytes)>(4);
             tx.send((100usize, Bytes::from(vec![0u8; 1])))
                 .await
                 .expect("send");
             drop(tx);
-            super::super::write_to_sink_mmap(mmap, &mut rx)
+            super::super::write_to_sink_mmap(mmap, rx)
                 .await
                 .expect_err("offset==len with data should be rejected");
         }
@@ -1234,12 +1296,12 @@ mod tests {
                 ptr,
                 len: buf.len(),
             };
-            let (tx, mut rx) = channel::<(usize, Bytes)>(4);
+            let (tx, rx) = channel::<(usize, Bytes)>(4);
             tx.send((usize::MAX - 5, Bytes::from(vec![0u8; 10])))
                 .await
                 .expect("send");
             drop(tx);
-            let err = super::super::write_to_sink_mmap(mmap, &mut rx)
+            let err = super::super::write_to_sink_mmap(mmap, rx)
                 .await
                 .expect_err("offset + len overflow rejected");
             assert!(
