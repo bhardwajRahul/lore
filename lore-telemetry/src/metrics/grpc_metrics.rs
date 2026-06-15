@@ -32,7 +32,8 @@ fn seconds_histogram(name: impl Into<Cow<'static, str>>) -> Histogram<f64> {
         .get_or_init(|| meter(METER_SCOPE))
         .f64_histogram(name)
         .with_boundaries(vec![
-            0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.2, 2.0, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0,
+            0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 1.2, 2.0, 5.0, 8.0, 10.0, 15.0, 20.0, 32.0, 40.0,
+            60.0,
         ])
         .with_unit("s")
         .build()
