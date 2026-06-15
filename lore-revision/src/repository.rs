@@ -1480,7 +1480,7 @@ pub async fn create_client_mutable_store(
         let local_mutable = dotpath.join("mutable");
         if local_mutable.exists() {
             return Err(RepositoryError::internal(
-                "This repository has a local mutable store but is configured to use a shared store. Reclone the repository with `lore clone --use-global-store` to use the shared mutable store.",
+                "This repository has a local mutable store but is configured to use a shared store. Reclone the repository with `lore clone --use-shared-store` to use the shared mutable store.",
             ));
         }
 
@@ -2087,6 +2087,10 @@ pub async fn create_local(
             }
             (imm, mut_)
         } else {
+            crate::shared_store::ensure_shared_store_for_repo(&config)
+                .await
+                .forward::<RepositoryError>("Failed to create shared store")?;
+
             // Setup the data stores - don't care about eviction/compaction in the new repository
             let immutable_store = create_client_immutable_store(
                 &config,

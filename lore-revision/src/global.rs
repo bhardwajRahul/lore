@@ -134,6 +134,13 @@ impl GlobalConfig {
         Ok(new_path)
     }
 
+    /// The per-remote subdirectory name within a shared store base path. A base
+    /// path holds one such directory per remote URL so a single base can back
+    /// the stores of multiple endpoints at once.
+    pub fn shared_store_subdir_for_remote(remote_url: &str) -> String {
+        Self::escape_url_as_dirname(normalize_remote_url(remote_url))
+    }
+
     fn escape_url_as_dirname(url: &str) -> String {
         url.chars()
             .map(|c| match c {
